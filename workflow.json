@@ -1,0 +1,253 @@
+{
+  "name": "Support Ticket Triage & Auto-Reply",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-manual-trigger",
+      "name": "0a. Test Manually (click Execute)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1620, 180]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "name", "value": "Priya Sharma", "type": "string" },
+            { "id": "a2", "name": "email", "value": "priya@example.com", "type": "string" },
+            { "id": "a3", "name": "message", "value": "I have been charged TWICE this month and nobody is responding! If I don't get my money back today I am cancelling and disputing the charge with my bank.", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-sample-ticket",
+      "name": "0b. Sample Ticket (EDIT ME)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-1400, 180]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-ticket",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "1. New Ticket (Webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1400, 400],
+      "webhookId": "support-ticket-triage"
+    },
+    {
+      "parameters": {
+        "jsCode": "// DETERMINISTIC STEP: Validate incoming ticket has required fields.\n// If anything is missing, we mark it invalid and route it to the fallback queue.\n\nconst body = $input.first().json.body || $input.first().json;\n\nconst name = (body.name || '').trim();\nconst email = (body.email || '').trim();\nconst message = (body.message || '').trim();\n\nconst emailOk = /^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email);\nconst isValid = name.length > 0 && emailOk && message.length >= 5;\n\nreturn [{\n  json: {\n    name,\n    email,\n    message,\n    isValid,\n    validationError: isValid ? '' : 'Missing or invalid name/email/message',\n    receivedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-validate",
+      "name": "2. Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1140, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "valid-check",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-valid",
+      "name": "3. Is Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-920, 400]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "value": "claude-sonnet-4-6", "mode": "list", "cachedResultName": "Claude Sonnet 4.6" },
+        "messages": {
+          "values": [
+            {
+              "content": "You are a Support Ticket Triage Agent. Your ONLY job is to read one customer support message and return a strict JSON object. Do not write a reply. Do not add any text before or after the JSON.\n\nClassify the ticket on these fields:\n- category: one of \"billing\", \"technical\", \"account\", \"general\"\n- urgency: one of \"high\", \"medium\", \"low\"\n  - high = angry customer, threatening to cancel, money lost, service fully broken, legal/safety words\n  - medium = something is broken but there is a workaround, or moderate frustration\n  - low = simple how-to question, general info, calm tone\n- sentiment: one of \"angry\", \"frustrated\", \"neutral\", \"happy\"\n- summary: one short sentence describing the issue\n- is_common_question: true if this is a routine FAQ-style question a standard reply can solve (e.g. how to reset password, where to find invoice), false otherwise\n- confidence: a number from 0 to 1 for how confident you are in this classification\n\nReturn ONLY valid JSON in exactly this shape:\n{\"category\":\"\",\"urgency\":\"\",\"sentiment\":\"\",\"summary\":\"\",\"is_common_question\":false,\"confidence\":0}\n\nCustomer name: {{ $json.name }}\nCustomer message: {{ $json.message }}",
+              "role": "user"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-triage-agent",
+      "name": "4. Triage Agent (AI)",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [-700, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DETERMINISTIC STEP: Parse the AI's JSON safely and apply a confidence threshold.\n// If the AI returned junk or low confidence, mark for manual review (fallback).\n\nconst aiText = $input.first().json.content?.[0]?.text\n  || $input.first().json.text\n  || $input.first().json.message?.content\n  || '';\n\n// Pull the original ticket fields forwarded alongside\nconst ticket = $('2. Validate Input').first().json;\n\nlet parsed = null;\ntry {\n  const match = aiText.match(/\\{[\\s\\S]*\\}/);\n  parsed = match ? JSON.parse(match[0]) : null;\n} catch (e) {\n  parsed = null;\n}\n\nconst CONFIDENCE_THRESHOLD = 0.6;\nconst valid = parsed\n  && ['billing','technical','account','general'].includes(parsed.category)\n  && ['high','medium','low'].includes(parsed.urgency)\n  && typeof parsed.confidence === 'number';\n\nconst needsManualReview = !valid || parsed.confidence < CONFIDENCE_THRESHOLD;\n\nreturn [{\n  json: {\n    name: ticket.name,\n    email: ticket.email,\n    message: ticket.message,\n    receivedAt: ticket.receivedAt,\n    category: valid ? parsed.category : 'general',\n    urgency: valid ? parsed.urgency : 'medium',\n    sentiment: valid ? parsed.sentiment : 'neutral',\n    summary: valid ? parsed.summary : 'Could not classify automatically',\n    is_common_question: valid ? !!parsed.is_common_question : false,\n    confidence: valid ? parsed.confidence : 0,\n    needsManualReview,\n    routedReason: needsManualReview ? 'Low confidence or invalid AI output' : 'Auto-triaged'\n  }\n}];"
+      },
+      "id": "node-parse",
+      "name": "5. Parse & Confidence Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-480, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "manual-check",
+              "leftValue": "={{ $json.needsManualReview }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-confidence",
+      "name": "6. Needs Manual Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-260, 280]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  { "id": "high-rule", "leftValue": "={{ $json.urgency }}", "rightValue": "high", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "High Urgency"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  { "id": "common-rule", "leftValue": "={{ $json.is_common_question }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "Common Question"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "node-switch-urgency",
+      "name": "7. Route by Urgency",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [40, 180]
+    },
+    {
+      "parameters": {
+        "modelId": { "__rl": true, "value": "claude-sonnet-4-6", "mode": "list", "cachedResultName": "Claude Sonnet 4.6" },
+        "messages": {
+          "values": [
+            {
+              "content": "You are a Customer Support Reply Drafter. Write a warm, professional, concise reply to the customer. Address them by name. Acknowledge their issue, give a helpful next step, and keep it under 120 words. Do NOT invent account details or promise refunds you cannot verify — instead say the relevant team will follow up.\n\nCustomer name: {{ $json.name }}\nIssue summary: {{ $json.summary }}\nCategory: {{ $json.category }}\nOriginal message: {{ $json.message }}\n\nReturn only the reply text.",
+              "role": "user"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-reply-agent",
+      "name": "8. Draft Reply Agent (AI)",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [320, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DETERMINISTIC STEP: Build the human-escalation alert payload for high-urgency tickets.\n// In a real system this would notify an on-call agent and pause for approval (human-in-the-loop).\nconst t = $input.first().json;\nreturn [{\n  json: {\n    ...t,\n    action: 'ESCALATED_TO_HUMAN',\n    draftReply: '',\n    alert: `⚠️ HIGH URGENCY ticket from ${t.name} (${t.email}). Sentiment: ${t.sentiment}. Issue: ${t.summary}. A human must review before replying.`\n  }\n}];"
+      },
+      "id": "node-escalate",
+      "name": "9. Escalate to Human",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DETERMINISTIC STEP: attach the AI-drafted reply to the ticket record so it can be logged/sent.\nconst reply = $input.first().json.content?.[0]?.text || $input.first().json.text || '';\nconst t = $('5. Parse & Confidence Check').first().json;\nreturn [{ json: { ...t, action: 'AUTO_REPLIED', draftReply: reply, alert: '' } }];"
+      },
+      "id": "node-attach-reply",
+      "name": "10. Attach Draft Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DETERMINISTIC STEP: format the manual-review fallback record.\nconst t = $input.first().json;\nreturn [{\n  json: {\n    name: t.name || 'unknown',\n    email: t.email || 'unknown',\n    message: t.message || '',\n    category: t.category || 'general',\n    urgency: t.urgency || 'medium',\n    sentiment: t.sentiment || 'neutral',\n    summary: t.summary || (t.validationError || 'Sent to manual review'),\n    confidence: t.confidence || 0,\n    action: 'MANUAL_REVIEW',\n    draftReply: '',\n    alert: 'Ticket needs human triage (invalid input or low AI confidence).',\n    receivedAt: t.receivedAt || new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-manual",
+      "name": "11. Manual Review Queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-40, 540]
+    },
+    {
+      "parameters": {
+        "jsCode": "// FINAL OUTPUT (deterministic): build the triage record + the outgoing message.\n// This stands in for 'Log to Google Sheet' + 'Send Email' — it produces the exact\n// same structured record, shown directly inside n8n (no external credentials needed).\nconst t = $input.first().json;\n\nconst outgoingMessage = t.action === 'AUTO_REPLIED'\n  ? t.draftReply\n  : (t.action === 'ESCALATED_TO_HUMAN'\n      ? '[NOT SENT] Held for human review — ' + (t.alert || '')\n      : '[NOT SENT] Sent to manual review queue.');\n\nreturn [{\n  json: {\n    '— TRIAGE RECORD —': '',\n    receivedAt: t.receivedAt,\n    name: t.name,\n    email: t.email,\n    category: t.category,\n    urgency: t.urgency,\n    sentiment: t.sentiment,\n    summary: t.summary,\n    confidence: t.confidence,\n    action: t.action,\n    '— OUTGOING MESSAGE —': '',\n    emailSubject: 'Re: your support request [' + t.category + ']',\n    emailTo: t.email,\n    outgoingMessage\n  }\n}];"
+      },
+      "id": "node-output",
+      "name": "12. Final Output (Triage Record)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 320]
+    }
+  ],
+  "connections": {
+    "0a. Test Manually (click Execute)": { "main": [[{ "node": "0b. Sample Ticket (EDIT ME)", "type": "main", "index": 0 }]] },
+    "0b. Sample Ticket (EDIT ME)": { "main": [[{ "node": "2. Validate Input", "type": "main", "index": 0 }]] },
+    "1. New Ticket (Webhook)": { "main": [[{ "node": "2. Validate Input", "type": "main", "index": 0 }]] },
+    "2. Validate Input": { "main": [[{ "node": "3. Is Input Valid?", "type": "main", "index": 0 }]] },
+    "3. Is Input Valid?": {
+      "main": [
+        [{ "node": "4. Triage Agent (AI)", "type": "main", "index": 0 }],
+        [{ "node": "11. Manual Review Queue", "type": "main", "index": 0 }]
+      ]
+    },
+    "4. Triage Agent (AI)": { "main": [[{ "node": "5. Parse & Confidence Check", "type": "main", "index": 0 }]] },
+    "5. Parse & Confidence Check": { "main": [[{ "node": "6. Needs Manual Review?", "type": "main", "index": 0 }]] },
+    "6. Needs Manual Review?": {
+      "main": [
+        [{ "node": "11. Manual Review Queue", "type": "main", "index": 0 }],
+        [{ "node": "7. Route by Urgency", "type": "main", "index": 0 }]
+      ]
+    },
+    "7. Route by Urgency": {
+      "main": [
+        [{ "node": "9. Escalate to Human", "type": "main", "index": 0 }],
+        [{ "node": "8. Draft Reply Agent (AI)", "type": "main", "index": 0 }],
+        [{ "node": "8. Draft Reply Agent (AI)", "type": "main", "index": 0 }]
+      ]
+    },
+    "8. Draft Reply Agent (AI)": { "main": [[{ "node": "10. Attach Draft Reply", "type": "main", "index": 0 }]] },
+    "9. Escalate to Human": { "main": [[{ "node": "12. Final Output (Triage Record)", "type": "main", "index": 0 }]] },
+    "10. Attach Draft Reply": { "main": [[{ "node": "12. Final Output (Triage Record)", "type": "main", "index": 0 }]] },
+    "11. Manual Review Queue": { "main": [[{ "node": "12. Final Output (Triage Record)", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
